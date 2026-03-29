@@ -172,7 +172,7 @@ impl Builder {
         T: Send + 'scope,
     {
         Ok(ScopedJoinHandle(unsafe {
-            self.spawn_unchecked_(f, Some(scope.data.clone()))
+            self.spawn_unchecked_( async || f(), Some(scope.data.clone()))
         }?))
     }
 }

@@ -1,14 +1,17 @@
 use std::{
     cell::UnsafeCell,
     fmt,
+    future::Future,
     marker::PhantomData,
     mem,
     panic::{catch_unwind, AssertUnwindSafe},
+    pin::Pin,
     rc::Rc,
     sync::{Arc, Mutex},
     thread::{Result, Thread},
 };
 
+use futures::FutureExt;
 use scoped::ScopeData;
 pub use scoped::{scope, Scope, ScopedJoinHandle};
 use signal::Signal;
@@ -22,14 +25,14 @@ mod signal;
 mod utils;
 
 struct WebWorkerContext {
-    func: Box<dyn FnOnce() + Send>,
+    func: Box<dyn FnOnce() -> Pin<Box<dyn Future<Output = ()>>> + Send>,
 }
 
 /// Entry point for web workers
 #[wasm_bindgen]
-pub fn wasm_thread_entry_point(ptr: u32) {
+pub async fn wasm_thread_entry_point(ptr: u32) {
     let ctx = unsafe { Box::from_raw(ptr as *mut WebWorkerContext) };
-    (ctx.func)();
+    (ctx.func)().await;
     WorkerMessage::ThreadComplete.post();
 }
 
@@ -157,6 +160,16 @@ impl Builder {
         unsafe { self.spawn_unchecked(f) }
     }
 
+    pub fn spawn_async<F, T, Fut>(self, f: F) -> std::io::Result<JoinHandle<T>>
+    where
+        F: FnOnce() -> Fut,
+        F: Send + 'static,
+        Fut: Future<Output = T>,
+        T: Send + 'static,
+    {
+        Ok(JoinHandle(unsafe { self.spawn_unchecked_(f, None)? }))
+    }
+
     /// Spawns a new thread without any lifetime restrictions by taking ownership
     /// of the `Builder`, and returns an [std::io::Result] to its [`JoinHandle`].
     ///
@@ -177,17 +190,18 @@ impl Builder {
         F: Send + 'a,
         T: Send + 'a,
     {
-        Ok(JoinHandle(unsafe { self.spawn_unchecked_(f, None) }?))
+        Ok(JoinHandle(unsafe { self.spawn_unchecked_(async || f(), None) }?))
     }
 
-    pub(crate) unsafe fn spawn_unchecked_<'a, 'scope, F, T>(
+    pub(crate) unsafe fn spawn_unchecked_<'a, 'scope, F, T, Fut>(
         self,
         f: F,
         scope_data: Option<Arc<ScopeData>>,
     ) -> std::io::Result<JoinInner<'scope, T>>
     where
-        F: FnOnce() -> T,
+        F: FnOnce() -> Fut,
         F: Send + 'a,
+        Fut: Future<Output = T> + 'a,
         T: Send + 'a,
         'scope: 'a,
     {
@@ -226,29 +240,39 @@ impl Builder {
         }
 
         let f = MaybeDangling::new(f);
-        let main = Box::new(move || {
-            // SAFETY: we constructed `f` initialized.
-            let f = f.into_inner();
-            // Execute the closure and catch any panics
-            let try_result = catch_unwind(AssertUnwindSafe(|| f()));
-            // SAFETY: `their_packet` as been built just above and moved by the
-            // closure (it is an Arc<...>) and `my_packet` will be stored in the
-            // same `JoinInner` as this closure meaning the mutation will be
-            // safe (not modify it and affect a value far away).
-            unsafe { *their_packet.result.get() = Some(try_result) };
-            // Here `their_packet` gets dropped, and if this is the last `Arc` for that packet that
-            // will call `decrement_num_running_threads` and therefore signal that this thread is
-            // done.
-            drop(their_packet);
-            // Notify waiting handles
-            their_signal.signal();
-            // Here, the lifetime `'a` and even `'scope` can end. `main` keeps running for a bit
-            // after that before returning itself.
+        let main: Box<dyn FnOnce() -> Pin<Box<dyn Future<Output = ()> + 'a>> + Send + 'a> = Box::new(move || {
+            Box::pin(async move {
+                // SAFETY: we constructed `f` initialized.
+                let f = f.into_inner();
+                // Execute the closure and catch any panics
+                let try_result = catch_unwind(AssertUnwindSafe(|| f()));
+                let try_result = match try_result {
+                    Ok(fut) => AssertUnwindSafe(fut).catch_unwind().await,
+                    Err(err) => Err(err),
+                };
+
+                // SAFETY: `their_packet` as been built just above and moved by the
+                // closure (it is an Arc<...>) and `my_packet` will be stored in the
+                // same `JoinInner` as this closure meaning the mutation will be
+                // safe (not modify it and affect a value far away).
+                unsafe { *their_packet.result.get() = Some(try_result) };
+                // Here `their_packet` gets dropped, and if this is the last `Arc` for that packet that
+                // will call `decrement_num_running_threads` and therefore signal that this thread is
+                // done.
+                drop(their_packet);
+                // Notify waiting handles
+                their_signal.signal();
+                // Here, the lifetime `'a` and even `'scope` can end. `main` keeps running for a bit
+                // after that before returning itself.
+            })
         });
 
         // Erase lifetime
         let context = WebWorkerContext {
-            func: mem::transmute::<Box<dyn FnOnce() + Send + 'a>, Box<dyn FnOnce() + Send + 'static>>(main),
+            func: mem::transmute::<
+                Box<dyn FnOnce() -> Pin<Box<dyn Future<Output = ()> + 'a>> + Send + 'a>,
+                Box<dyn FnOnce() -> Pin<Box<dyn Future<Output = ()>>> + Send + 'static>,
+            >(main),
         };
 
         if is_web_worker_thread() {
