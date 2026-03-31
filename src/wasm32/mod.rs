@@ -1,5 +1,6 @@
 use std::{
-    cell::UnsafeCell,
+    cell::{RefCell, UnsafeCell},
+    collections::BTreeMap,
     fmt,
     future::Future,
     marker::PhantomData,
@@ -7,11 +8,13 @@ use std::{
     panic::{catch_unwind, AssertUnwindSafe},
     pin::Pin,
     rc::Rc,
-    sync::{Arc, Mutex},
+    str::FromStr as _,
+    sync::{atomic::AtomicUsize, Arc, Mutex},
     thread::{Result, Thread},
 };
 
 use futures::FutureExt;
+use js_sys::{BigInt, JsString, Object};
 use scoped::ScopeData;
 pub use scoped::{scope, Scope, ScopedJoinHandle};
 use signal::Signal;
@@ -26,7 +29,14 @@ mod utils;
 
 struct WebWorkerContext {
     func: Box<dyn FnOnce() -> Pin<Box<dyn Future<Output = ()>>> + Send>,
+    worker_idx: usize,
 }
+
+thread_local! {
+    /// A thread-local vector of u32 values
+    pub static WORKERS: RefCell<BTreeMap<usize, Rc<Worker>>> = const { RefCell::new(BTreeMap::new()) };
+}
+static WORKER_COUNTER: AtomicUsize = AtomicUsize::new(1);
 
 /// Entry point for web workers
 #[wasm_bindgen]
@@ -267,12 +277,15 @@ impl Builder {
             })
         });
 
+        let worker_idx = WORKER_COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+
         // Erase lifetime
         let context = WebWorkerContext {
             func: mem::transmute::<
                 Box<dyn FnOnce() -> Pin<Box<dyn Future<Output = ()> + 'a>> + Send + 'a>,
                 Box<dyn FnOnce() -> Pin<Box<dyn Future<Output = ()>>> + Send + 'static>,
             >(main),
+            worker_idx,
         };
 
         if is_web_worker_thread() {
@@ -288,6 +301,7 @@ impl Builder {
         Ok(JoinInner {
             signal: my_signal,
             packet: my_packet,
+            worker_idx,
         })
     }
 
@@ -332,22 +346,48 @@ impl Builder {
         // Spawn the worker
         let worker = Rc::new(Worker::new_with_options(script.as_str(), &options).unwrap());
 
-        // Make copy and keep a reference in callback handler so that GC does not despawn worker
-        let mut their_worker = Some(worker.clone());
+        let worker_idx = ctx.worker_idx;
+        WORKERS.with(|workers| {
+            workers.borrow_mut().insert(worker_idx, worker.clone());
+        });
 
         let callback = Closure::wrap(Box::new(move |x: &web_sys::MessageEvent| {
             // All u32 bits map to f64 mantisa so it's safe to cast like that
-            let req = Box::from_raw(x.data().as_f64().unwrap() as u32 as *mut WorkerMessage);
+            let data = x.data();
+            if let Some(num) = data.as_f64() {
+                let req = Box::from_raw(num as u32 as *mut WorkerMessage);
 
-            match *req {
-                WorkerMessage::SpawnThread(builder) => {
-                    builder.spawn();
-                }
-                WorkerMessage::ThreadComplete => {
-                    // Drop worker reference so it can be cleaned up by GC
-                    their_worker.take();
-                }
-            };
+                match *req {
+                    WorkerMessage::SpawnThread(builder) => {
+                        builder.spawn();
+                    }
+                    WorkerMessage::ThreadComplete => {
+                        // Drop worker reference so it can be cleaned up by GC
+                        WORKERS.with(|workers| {
+                            workers.borrow_mut().remove(&worker_idx);
+                        });
+                    }
+                };
+            } else {
+                let data = data.dyn_into::<js_sys::Map>().unwrap();
+
+                let worker_idx: BigInt = data
+                    .get(JsString::from_str("worker_idx").unwrap().upcast())
+                    .dyn_into()
+                    .unwrap();
+                let worker_idx: usize = worker_idx.to_js_string().as_string().unwrap().parse().unwrap();
+
+                let post_data = data.get(JsString::from_str("post_data").unwrap().upcast());
+
+                WORKERS.with(|workers| {
+                    workers
+                        .borrow_mut()
+                        .get(&worker_idx)
+                        .unwrap()
+                        .post_message(&post_data)
+                        .unwrap();
+                });
+            }
         }) as Box<dyn FnMut(&web_sys::MessageEvent)>);
         worker.set_onmessage(Some(callback.as_ref().unchecked_ref()));
 
@@ -429,6 +469,7 @@ impl<'scope, T> Drop for Packet<'scope, T> {
 pub(crate) struct JoinInner<'scope, T> {
     packet: Arc<Packet<'scope, T>>,
     signal: Arc<Signal>,
+    worker_idx: usize,
 }
 
 impl<'scope, T> JoinInner<'scope, T> {
@@ -440,6 +481,32 @@ impl<'scope, T> JoinInner<'scope, T> {
     pub async fn join_async(mut self) -> Result<T> {
         self.signal.wait_async().await;
         Arc::get_mut(&mut self.packet).unwrap().result.get_mut().take().unwrap()
+    }
+
+    pub fn post_message(&self, message: &wasm_bindgen::JsValue) {
+        if is_web_worker_thread() {
+            let actual_message = js_sys::Map::new();
+            actual_message.set(
+                JsString::from_str("worker_idx").unwrap().upcast(),
+                BigInt::from(self.worker_idx).upcast(),
+            );
+            actual_message.set(JsString::from_str("post_data").unwrap().upcast(), message);
+            js_sys::eval("self")
+                .unwrap()
+                .dyn_into::<DedicatedWorkerGlobalScope>()
+                .unwrap()
+                .post_message(actual_message.upcast())
+                .unwrap();
+        } else {
+            WORKERS.with(|workers| {
+                workers
+                    .borrow()
+                    .get(&self.worker_idx)
+                    .unwrap()
+                    .post_message(message)
+                    .unwrap()
+            });
+        }
     }
 }
 
@@ -466,6 +533,10 @@ impl<T> JoinHandle<T> {
     /// Checks if the associated thread has finished running its main function.
     pub fn is_finished(&self) -> bool {
         Arc::strong_count(&self.0.packet) == 1
+    }
+
+    pub fn post_message(&self, message: &wasm_bindgen::JsValue) {
+        self.0.post_message(message);
     }
 }
 
