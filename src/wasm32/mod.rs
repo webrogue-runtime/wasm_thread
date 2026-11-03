@@ -14,7 +14,7 @@ use std::{
 };
 
 use futures::FutureExt;
-use js_sys::{BigInt, JsString, Object};
+use js_sys::{BigInt, JsString};
 use scoped::ScopeData;
 pub use scoped::{scope, Scope, ScopedJoinHandle};
 use signal::Signal;
@@ -315,7 +315,7 @@ impl Builder {
         } = self;
 
         // Get worker script as URL encoded blob
-        let script = worker_script_url.unwrap_or(get_worker_script(wasm_bindgen_shim_url));
+        let script = worker_script_url.unwrap_or_else(|| get_worker_script(wasm_bindgen_shim_url));
 
         // Todo: figure out how to set stack size
         let options = WorkerOptions::new();
