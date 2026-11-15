@@ -5,7 +5,7 @@ import init, { wasm_thread_entry_point } from "WASM_BINDGEN_SHIM_URL";
 // Once we've got it, initialize it all with the `wasm_bindgen` global we imported via
 // `importScripts`.
 self.onmessage = event => {
-    const [module_or_path, memory, work] = event.data;
+    const [module_or_path, memory, work, payload] = event.data;
 
     init({ module_or_path, memory }).catch(err => {
         console.log(err);
@@ -19,7 +19,7 @@ self.onmessage = event => {
     }).then(() => {
         // Enter rust code by calling entry point defined in `lib.rs`.
         // This executes closure defined by work context.
-        wasm_thread_entry_point(work).then(() => {
+        wasm_thread_entry_point(work, payload).then(() => {
             // Once done, terminate web worker
             close();
         });

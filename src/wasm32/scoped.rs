@@ -1,13 +1,13 @@
 use std::{
     marker::PhantomData,
-    panic::{catch_unwind, resume_unwind, AssertUnwindSafe},
+    panic::{AssertUnwindSafe, catch_unwind, resume_unwind},
     sync::{
-        atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
 };
 
-use super::{signal::Signal, utils::is_web_worker_thread, Builder, JoinInner};
+use super::{Builder, JoinInner, signal::Signal, utils::is_web_worker_thread};
 
 /// A scope to spawn scoped threads in.
 ///
@@ -172,7 +172,7 @@ impl Builder {
         T: Send + 'scope,
     {
         Ok(ScopedJoinHandle(unsafe {
-            self.spawn_unchecked_( async || f(), Some(scope.data.clone()))
+            self.spawn_unchecked_(async || f(), Some(scope.data.clone()), None)
         }?))
     }
 }
